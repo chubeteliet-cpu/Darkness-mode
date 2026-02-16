@@ -1,0 +1,365 @@
+-- LocalScript: Random entity spawner (ambient + darkness) using RANDOM ROOM SCHEDULER (no %)
+-- Paste vào StarterPlayerScripts
+
+local Players = game:GetService("Players")
+local Debris = game:GetService("Debris")
+local RS = game:GetService("ReplicatedStorage")
+local Workspace = workspace
+
+local player = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+-- ---------- tiny safe wrappers ----------
+local function safeCall(fn) local ok,err = pcall(fn) if not ok then warn(err) end end
+local function log(...) print("[Spawner]", ...) end
+
+-- ---------- CONFIG (chỉnh ở đây) ----------
+local ENTITIES = {
+    {
+        name = "Hunger",
+        url = "https://raw.githubusercontent.com/rrealblueyt-oss/Hunger/refs/heads/main/Hunger",
+        weight = 1.2,
+        modes = {
+            ambient = { weight = 80, minDelay = 8, maxDelay = 20, maxPerSpawn = 1, cooldown = 15 },
+            darkness = { weight = 20, minDelay = 0.5, maxDelay = 2, maxPerSpawn = 3, cooldown = 60 },
+        }
+    },
+    {
+        name = "Rebound",
+        url = "https://raw.githubusercontent.com/rrealblueyt-oss/Rebound-/refs/heads/main/Rebound",
+        weight = 1.0,
+        modes = {
+            ambient = { weight = 70, minDelay = 6, maxDelay = 18, maxPerSpawn = 1, cooldown = 12 },
+            darkness = { weight = 30, minDelay = 0.8, maxDelay = 3, maxPerSpawn = 2, cooldown = 50 },
+        }
+    },
+    {
+        name = "Smiler",
+        url = "https://rawscripts.net/raw/Universal-Script-Smiler-111615",
+        weight = 0.9,
+        modes = {
+            ambient = { weight = 85, minDelay = 10, maxDelay = 25, maxPerSpawn = 1, cooldown = 20 },
+            darkness = { weight = 15, minDelay = 1, maxDelay = 3, maxPerSpawn = 2, cooldown = 70 },
+        }
+    },
+    {
+        name = "Silence",
+        url = "https://raw.githubusercontent.com/rrealblueyt-oss/Silence-/refs/heads/main/Silence.lua",
+        weight = 1.1,
+        modes = {
+            ambient = { weight = 75, minDelay = 7, maxDelay = 15, maxPerSpawn = 1, cooldown = 18 },
+            darkness = { weight = 25, minDelay = 0.6, maxDelay = 2.5, maxPerSpawn = 2, cooldown = 55 },
+        }
+    },
+}
+
+local GLOBAL = {
+    globalMinDelay = 1.5,
+    globalMaxDelay = 4.5,
+    maxConcurrentDarkness = 2,
+    allowImmediateOnStart = false, -- theo memory: KHÔNG spawn ngay khi bật
+    initialWaitRange = {2,6},
+}
+
+-- ---------- internal state ----------
+local spawnEntries = {}        -- flatten entries {name,url,mode,weight,minDelay,maxDelay,maxPerSpawn,cooldown}
+local lastSpawnTime = {}
+local concurrentDarkness = 0
+local lightingSaved = nil
+
+-- ---------- helpers ----------
+local function randFloat(a,b) return a + math.random() * (b - a) end
+
+local function buildSpawnEntries()
+    spawnEntries = {}
+    for _, ent in ipairs(ENTITIES) do
+        local baseW = ent.weight or 1
+        for modeName, modeData in pairs(ent.modes or {}) do
+            local w = (modeData.weight or 1) * baseW
+            local url = ent.urls and ent.urls[modeName] or ent.url
+            table.insert(spawnEntries, {
+                name = ent.name,
+                url = url,
+                mode = modeName,
+                weight = w,
+                minDelay = modeData.minDelay or 1,
+                maxDelay = modeData.maxDelay or 2,
+                maxPerSpawn = modeData.maxPerSpawn or 1,
+                cooldown = modeData.cooldown or 10,
+            })
+        end
+    end
+end
+
+local function chooseWeighted(entries)
+    local sum = 0
+    for _, e in ipairs(entries) do sum = sum + e.weight end
+    if sum <= 0 then return nil end
+    local pick = math.random() * sum
+    local acc = 0
+    for _, e in ipairs(entries) do
+        acc = acc + e.weight
+        if pick <= acc then return e end
+    end
+    return entries[#entries]
+end
+
+-- Save/restore lighting for darkness effect
+local function saveLighting()
+    if lightingSaved then return end
+    local L = game:GetService("Lighting")
+    lightingSaved = {
+        FogStart = L.FogStart,
+        FogEnd = L.FogEnd,
+        FogColor = L.FogColor,
+        Brightness = L.Brightness,
+        ExposureCompensation = L.ExposureCompensation,
+    }
+end
+local function applyDarknessLighting()
+    local L = game:GetService("Lighting")
+    L.FogStart = 0
+    L.FogEnd = 60
+    L.FogColor = Color3.fromRGB(0,0,0)
+    L.Brightness = 0
+    L.ExposureCompensation = -1
+end
+local function restoreLighting()
+    if not lightingSaved then return end
+    local L = game:GetService("Lighting")
+    safeCall(function()
+        L.FogStart = lightingSaved.FogStart
+        L.FogEnd = lightingSaved.FogEnd
+        L.FogColor = lightingSaved.FogColor
+        L.Brightness = lightingSaved.Brightness
+        L.ExposureCompensation = lightingSaved.ExposureCompensation
+    end)
+    lightingSaved = nil
+end
+
+-- safe synchronous load/run that returns ok, err (used by scheduler)
+local function safeLoadRemoteEntry(entry)
+    if not entry or not entry.url or entry.url == "" then
+        return false, "no url"
+    end
+    local resultOk, resultErr = pcall(function()
+        local prevMode, prevEntity = _G.SPAWN_MODE, _G.SPAWN_ENTITY
+        _G.SPAWN_MODE = entry.mode
+        _G.SPAWN_ENTITY = entry.name
+        local code = game:HttpGet(entry.url)
+        if not code or code == "" then error("empty response") end
+        local fn, loadErr = loadstring(code)
+        if not fn then error("loadstring failed: "..tostring(loadErr)) end
+        local okRun, runErr = pcall(fn)
+        if not okRun then error("runtime error: "..tostring(runErr)) end
+        _G.SPAWN_MODE = prevMode
+        _G.SPAWN_ENTITY = prevEntity
+    end)
+    if resultOk then
+        return true, nil
+    else
+        return false, tostring(resultErr)
+    end
+end
+
+local function canSpawn(entry)
+    local last = lastSpawnTime[entry.name] or 0
+    if os.clock() - last < entry.cooldown then return false end
+    if entry.mode == "darkness" and concurrentDarkness >= GLOBAL.maxConcurrentDarkness then return false end
+    return true
+end
+
+-- ---------- GUI (logo) + caption block ----------
+task.spawn(function()
+    local guiName = "LogoGui_Spawner"
+    local pg = player:WaitForChild("PlayerGui")
+    local existing = pg:FindFirstChild(guiName)
+    if existing then safeCall(function() existing:Destroy() end) end
+
+    safeCall(function()
+        local g = Instance.new("ScreenGui")
+        g.Name = guiName
+        g.ResetOnSpawn = false
+        g.Parent = pg
+
+        local img = Instance.new("ImageLabel")
+        img.Size = UDim2.new(0.4,0,0.4,0)
+        img.Position = UDim2.new(0.3,0,0.3,0)
+        img.BackgroundTransparency = 1
+        img.Image = "rbxassetid://121459142161741"
+        img.Parent = g
+
+        task.wait(7)
+        if g and g.Parent then g:Destroy() end
+
+        -- NOTE: Don't save lighting here; saving happens on first darkness spawn
+        local L = game:GetService("Lighting")
+        L.FogStart = 0
+        L.FogEnd = 60
+        L.FogColor = Color3.fromRGB(0,0,0)
+        L.Brightness = 0
+        L.ExposureCompensation = -1
+    end)
+end)
+
+task.spawn(function()
+    local tries = 0
+    repeat
+        task.wait(0.5)
+        tries = tries + 1
+        if tries > 30 then break end
+    until (player and player:FindFirstChild("PlayerGui") and player.PlayerGui:FindFirstChild("MainUI")
+        and player.PlayerGui.MainUI:FindFirstChild("Initiator") and player.PlayerGui.MainUI.Initiator:FindFirstChild("Main_Game"))
+
+    local MainGame
+    if player and player:FindFirstChild("PlayerGui") and player.PlayerGui:FindFirstChild("MainUI")
+        and player.PlayerGui.MainUI:FindFirstChild("Initiator") and player.PlayerGui.MainUI.Initiator:FindFirstChild("Main_Game") then
+        local ok, mod = pcall(function() return require(player.PlayerGui.MainUI.Initiator.Main_Game) end)
+        if ok and mod and type(mod.caption) == "function" then MainGame = mod end
+    end
+
+    if MainGame then
+        pcall(function() MainGame.caption("dark mode by chú bé tê liệt and realblueyt,", true) end)
+    else
+        task.spawn(function()
+            task.wait(0.4)
+            if player and player:FindFirstChild("PlayerGui") then
+                safeCall(function()
+                    local g = Instance.new("ScreenGui")
+                    g.ResetOnSpawn = false
+                    g.Name = "OD_CAP_FALLBACK"
+                    g.Parent = player.PlayerGui
+                    local l = Instance.new("TextLabel", g)
+                    l.Size = UDim2.fromScale(1,0.08); l.Position = UDim2.fromScale(0,0.45)
+                    l.BackgroundTransparency = 1; l.TextScaled = true; l.Font = Enum.Font.GothamBold
+                    l.Text = "dark mode by chú bé tê liệt and realblueyt,"
+                    Debris:AddItem(g,6)
+                end)
+            end
+        end)
+    end
+
+    if Workspace:FindFirstChild("CurrentRooms") then
+        Workspace.CurrentRooms.ChildAdded:Connect(function(room)
+            local rn = tonumber(room.Name)
+            if rn == 1 then
+                task.wait(0.2)
+                if MainGame then
+                    pcall(function() MainGame.caption("good luck !", true) end)
+                else
+                    if player and player:FindFirstChild("PlayerGui") then
+                        pcall(function()
+                            local g = Instance.new("ScreenGui")
+                            g.ResetOnSpawn = false
+                            g.Name = "OD_CAP_ROOM1"
+                            g.Parent = player.PlayerGui
+                            local l = Instance.new("TextLabel", g)
+                            l.Size = UDim2.fromScale(1,0.06); l.Position = UDim2.fromScale(0,0.88)
+                            l.BackgroundTransparency = 1; l.TextScaled = true; l.Font = Enum.Font.GothamBold
+                            l.TextColor3 = Color3.fromRGB(170,255,200); l.Text = "good luck 👍🗿"
+                            Debris:AddItem(g,6)
+                        end)
+                    end
+                end
+            end
+        end)
+    end
+end)
+
+-- ---------- build spawn table ----------
+buildSpawnEntries()
+
+-- ---------- REPLACE main spawner loop with RANDOM ROOM SCHEDULER (no %) ----------
+task.spawn(function()
+    -- wait for RS.GameData.LatestRoom to exist
+    while not (RS:FindFirstChild("GameData") and RS.GameData:FindFirstChild("LatestRoom")) do
+        task.wait(0.4)
+    end
+
+    local LatestRoom = RS.GameData.LatestRoom
+    local lastRoom = LatestRoom.Value or 0
+
+    local function scheduleNext(fromRoom)
+        return (fromRoom or lastRoom) + math.random(3,7)
+    end
+
+    getgenv().OVERDOORS_nextEntityRoom = getgenv().OVERDOORS_nextEntityRoom or scheduleNext(lastRoom)
+    local nextSpawn = getgenv().OVERDOORS_nextEntityRoom
+    local busy = false
+
+    LatestRoom.Changed:Connect(function()
+        local cur = LatestRoom.Value or 0
+        if cur <= lastRoom then lastRoom = cur; return end
+        lastRoom = cur
+        if cur == nextSpawn then
+            if not busy then
+                busy = true
+                task.spawn(function()
+                    -- check whether an entity-like model already exists in Workspace
+                    local found = false
+                    for _, m in ipairs(Workspace:GetChildren()) do
+                        if m:IsA("Model") then
+                            local n = tostring(m.Name):lower()
+                            if n:find("repentance") or n:find("seek") or n:find("ambush") or n:find("rush") then
+                                found = true
+                                break
+                            end
+                        end
+                    end
+
+                    if not found then
+                        -- choose a random entry from spawnEntries
+                        if #spawnEntries == 0 then
+                            log("no spawnEntries available")
+                        else
+                            local entry = spawnEntries[math.random(1, #spawnEntries)]
+                            -- ensure entry respects cooldown and concurrency
+                            if not canSpawn(entry) then
+                                log("entry not allowed (cooldown/concurrency), skipping:", entry.name, entry.mode)
+                            else
+                                -- handle darkness lighting state
+                                if entry.mode == "darkness" then
+                                    concurrentDarkness = concurrentDarkness + 1
+                                    if concurrentDarkness == 1 then
+                                        saveLighting()
+                                        applyDarknessLighting()
+                                    end
+                                end
+
+                                lastSpawnTime[entry.name] = os.clock()
+                                local ok, err = safeLoadRemoteEntry(entry)
+                                if ok then
+                                    log("spawned entity:", entry.name, "mode="..tostring(entry.mode))
+                                else
+                                    log("spawn failed for", entry.name, ":", err)
+                                end
+
+                                -- schedule decay for darkness concurrency if needed
+                                if entry.mode == "darkness" then
+                                    local decay = math.max(5, entry.cooldown * 0.2)
+                                    task.spawn(function()
+                                        task.wait(decay)
+                                        concurrentDarkness = math.max(0, concurrentDarkness - 1)
+                                        if concurrentDarkness == 0 then
+                                            restoreLighting()
+                                        end
+                                    end)
+                                end
+                            end
+                        end
+                    else
+                        log("entity present in workspace -> skip spawn")
+                    end
+
+                    task.wait(2)
+                    busy = false
+                end)
+            end
+
+            nextSpawn = scheduleNext(cur)
+            getgenv().OVERDOORS_nextEntityRoom = nextSpawn
+            log("next entity scheduled at room", nextSpawn)
+        end
+    end)
+end)
+
+print("[RoomSchedulerSpawner] Started. Next spawn room:", tostring(getgenv().OVERDOORS_nextEntityRoom))
